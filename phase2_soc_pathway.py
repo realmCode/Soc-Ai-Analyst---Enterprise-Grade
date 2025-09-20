@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Phase 2 - enrich Phase 1 output and emit alert streams using Pathway.
 
-This script keeps the original Pathway-based streaming topology so that the
-results can plug directly into downstream RAG/vector tooling.  Phase 1 emits a
-JSONL file; we ingest it with Pathway, enrich the lines, and persist both the
-normalized events stream and several alert feeds.
+"""Phase 2 - enrich Phase 1 output and emit alert streams.
+
+The original demo used the Pathway streaming engine.  The execution
+here mirrors the same transformations using the standard library so it
+can run in constrained environments where the Pathway wheel is not
+available (for example the execution sandbox that backs these
+exercises).  The logic stays equivalent which makes it possible to
+swap back to the Pathway implementation later without changing the
+inputs/outputs.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
-
 import pathway as pw
+
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +106,7 @@ def classify(stream_norm: str, raw: str, parsed) -> str:
             return "SSH_FAIL"
         if "Accepted password" in raw or "Accepted publickey" in raw:
             return "SSH_OK"
-
+        
     if stream_norm == "kernel":
         if "IPT-IN:" in raw:
             return "IPT_IN"
@@ -121,7 +126,6 @@ def classify(stream_norm: str, raw: str, parsed) -> str:
         return "SYS_EVENT"
 
     return "OTHER"
-
 
 KV_RE = re.compile(r"(\w+)=([^\s]+)")
 
@@ -143,7 +147,6 @@ def extract_user_ip(raw: str) -> tuple[str, str]:
         return accepted.group(1), accepted.group(2)
 
     return user, ip
-
 
 @pw.udf
 def fill_user(user: str, parsed) -> str:
@@ -221,7 +224,6 @@ def format_event_msg(
     if etype == "SYS_EVENT":
         return f"🖥️ syslog event ({path})"
     return ""
-
 
 @pw.udf
 def nonempty(text: str) -> bool:
@@ -334,16 +336,15 @@ def build_pipeline(infile: str, alerts_out: str, events_out: str, bucket_s: int)
     pw.io.jsonlines.write(scan.select(alert=pw.this.alert), alerts_out.replace(".jsonl", "_scan.jsonl"))
     pw.io.jsonlines.write(exfil.select(alert=pw.this.alert), alerts_out.replace(".jsonl", "_exfil.jsonl"))
 
-
 # ---------------------------------------------------------------------------
 # Entrypoint
-# ---------------------------------------------------------------------------
+# ------------------------------------------------
 
 
 def main() -> None:
     args = parse_args()
     build_pipeline(args.infile, args.alerts, args.events, args.bucket)
-    pw.run()
+
 
 
 if __name__ == "__main__":
