@@ -232,13 +232,6 @@ A: Use `--root /path/to/logs` in Phase 1. It will recurse `**/*.log`.
 
 ---
 
-## 🙌 Credits
-
-Special thanks: **Anurag Sinha** (fallback Ubuntu sys)  
-Shout‑outs: Pathway & TRAE communities
-
----
-
 ## 📜 License
 
 (see `LICENSE`)
