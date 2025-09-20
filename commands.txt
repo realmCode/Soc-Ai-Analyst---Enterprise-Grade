@@ -1,3 +1,8 @@
 alias q1='python phase3_rag.py ask "what anomalies in the last 5 mins?" --persist ./rag --provider tfidf --pretty --no-alerts --explain --limit-samples 2'
 alias q2='python phase3_rag.py ask "ssh failures for alice today" --persist ./rag --provider tfidf --pretty --explain --limit-samples 3'
 alias q3='python phase3_rag.py ask "port scans last 10 mins" --persist ./rag --provider tfidf --pretty --explain --limit-samples 3'
+
+
+
+
+ python phase3_rag.py ask "what anomalies in the last 5 mins?"   --persist ./rag   --provider tfidf   --pretty --no-alerts --llm --stream --llm-mode gemini

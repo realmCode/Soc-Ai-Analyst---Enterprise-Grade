@@ -597,34 +597,178 @@ def _extract_user(text: str) -> str:
 # --------------------------
 # LLM explanations (Gemini)
 # --------------------------
-def llm_explain(clusters: List[Dict[str,Any]], query: str, max_items: int = 3) -> List[str]:
+# --------------------------
+# LLM explanations (Gemini) — enum safety settings + robust fallback
+# --------------------------
+# --------------------------
+# Gemini LLM explanations (streaming + strict modes)
+# --------------------------
+def _gemini_text_from_resp(resp) -> str:
+    """Works across SDK versions: returns best-effort text."""
+    # Newer SDKs: resp.text; Streaming chunks: each ev has .text too
+    t = getattr(resp, "text", None)
+    if t:
+        return t
+    # Fallback: try candidates list
+    try:
+        parts = []
+        for c in getattr(resp, "candidates", []) or []:
+            for ct in getattr(c, "content", {}).get("parts", []) or []:
+                val = getattr(ct, "text", None) or (ct.get("text") if isinstance(ct, dict) else None)
+                if val:
+                    parts.append(val)
+        return "".join(parts)
+    except Exception:
+        return ""
+
+def _build_gemini_model():
+    import google.generativeai as genai
+    # Try both locations for the enums
+    try:
+        from google.generativeai.types import HarmCategory, HarmBlockThreshold
+    except Exception:
+        from google.generativeai.types.safety_types import HarmCategory, HarmBlockThreshold  # older SDKs
+
+    # Helper to fetch whatever enum name exists on this SDK
+    def _enum_attr(E, *candidates):
+        for name in candidates:
+            if hasattr(E, name):
+                return getattr(E, name)
+        return None
+
+    # Try a range of names used across releases
+    cat_sexual      = _enum_attr(HarmCategory, "HARM_CATEGORY_SEXUAL_CONTENT", "SEXUAL_CONTENT", "SEXUAL")
+    cat_hate        = _enum_attr(HarmCategory, "HARM_CATEGORY_HATE_SPEECH", "HATE_SPEECH", "HATE")
+    cat_harass      = _enum_attr(HarmCategory, "HARM_CATEGORY_HARASSMENT", "HARASSMENT")
+    cat_danger      = _enum_attr(HarmCategory, "HARM_CATEGORY_DANGEROUS_CONTENT", "DANGEROUS_CONTENT", "DANGEROUS")
+
+    block_none      = _enum_attr(HarmBlockThreshold, "BLOCK_NONE", "NONE", "BLOCK_LOW")  # last fallback = permissive-ish
+
+    # Build a dict only with enums that actually exist
+    safety_settings = {}
+    for c in (cat_sexual, cat_hate, cat_harass, cat_danger):
+        if c is not None and block_none is not None:
+            safety_settings[c] = block_none
+
+    # Generation config (tolerate dict vs class)
+    try:
+        from google.generativeai.types import GenerationConfig
+        gen_cfg = GenerationConfig(temperature=0.2, top_p=0.9, top_k=40, max_output_tokens=180)
+    except Exception:
+        gen_cfg = dict(temperature=0.2, top_p=0.9, top_k=40, max_output_tokens=180)
+
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return []
-    model_name = os.getenv("GEMINI_CHAT_MODEL", "gemini-1.5-flash")
+        raise RuntimeError("GEMINI_API_KEY not set")
     genai.configure(api_key=api_key)
-    out = []
+
+    model_name = os.getenv("GEMINI_CHAT_MODEL", "gemini-1.5-flash")
+
+    # Some SDKs only accept safety/gen config at call-time
+    try:
+        model = genai.GenerativeModel(
+            model_name,
+            safety_settings=safety_settings if safety_settings else None,
+            generation_config=gen_cfg,
+            system_instruction=(
+                "You are a SOC analyst. Be precise, actionable, and avoid hallucinations. "
+                "Base your reasoning only on the provided cluster samples and summary."
+            ),
+        )
+    except TypeError:
+        model = genai.GenerativeModel(model_name)
+        model._soc_safety_settings = safety_settings if safety_settings else None
+        model._soc_generation_config = gen_cfg
+
+    return model
+
+
+def gemini_explain_nonstream(clusters, query, max_items=3):
+    import google.generativeai as genai
+
+    model = _build_gemini_model()
+    safety = getattr(model, "_soc_safety_settings", None)
+    gen_cfg = getattr(model, "_soc_generation_config", None)
+
+    outs = []
     for c in clusters[:max_items]:
-        prompt = f"""You are a SOC analyst. Explain this cluster briefly (<=120 words), actionable, no fluff.
+        prompt = f"""Explain this cluster briefly (≤120 words). Be actionable and specific.
 
 Query: {query}
 
-Cluster summary: {c.get('summary')}
-Type: {c.get('etype')}, Severity: {c.get('severity')}, Count: {c.get('count')}, Bucket: {c.get('bucket')}
-Samples (up to 3):
-{json.dumps(c.get('samples',[]), indent=2)}
+Cluster:
+- Summary: {c.get('summary')}
+- Type: {c.get('etype')}, Severity: {c.get('severity')}, Count: {c.get('count')}, Bucket: {c.get('bucket')}
+- Samples (up to 3):
+{json.dumps(c.get('samples', []), indent=2)}
 
-Include: likely cause, why it matters, and one recommended next step."""
-        try:
-            model = genai.GenerativeModel(model_name)
-            resp = model.generate_content(prompt)
-            txt = resp.text.strip() if hasattr(resp, "text") else str(resp).strip()
-            out.append(txt)
-        except Exception as e:
-            out.append("Explanation unavailable.")
-    return out
+Include: likely cause, why it matters, and one recommended next step. Avoid fluff. Don't invent facts beyond samples."""
+        kw = {"request_options": {"timeout": 25}}
+        if safety is not None:
+            kw["safety_settings"] = safety
+        if gen_cfg is not None:
+            kw["generation_config"] = gen_cfg
+
+        resp = model.generate_content(prompt, **kw)
+        txt = _gemini_text_from_resp(resp).strip()
+        outs.append(txt or "Explanation unavailable.")
+    return outs
 
 
+def gemini_explain_stream(clusters, query, max_items=3):
+    """
+    Stream Gemini explanations for top clusters.
+    Prints tokens as they arrive: 'llm (cluster i): <stream...>'
+    Returns a list of final strings (one per cluster).
+    """
+    import sys, time
+    import google.generativeai as genai
+
+    model = _build_gemini_model()
+    safety = getattr(model, "_soc_safety_settings", None)
+    gen_cfg = getattr(model, "_soc_generation_config", None)
+
+    finals = []
+    for idx, c in enumerate(clusters[:max_items], 1):
+        prompt = f"""Explain this cluster briefly (≤120 words). Be actionable and specific.
+
+Query: {query}
+
+Cluster:
+- Summary: {c.get('summary')}
+- Type: {c.get('etype')}, Severity: {c.get('severity')}, Count: {c.get('count')}, Bucket: {c.get('bucket')}
+- Samples (up to 3):
+{json.dumps(c.get('samples', []), indent=2)}
+
+Include: likely cause, why it matters, and one recommended next step. Avoid fluff. Don't invent facts beyond samples."""
+
+        # ------ THIS IS THE KW BLOCK YOU ASKED ABOUT ------
+        kw = {"request_options": {"timeout": 25}, "stream": True}
+        if safety is not None:
+            kw["safety_settings"] = safety
+        if gen_cfg is not None:
+            kw["generation_config"] = gen_cfg
+        # ---------------------------------------------------
+
+        # call Gemini with streaming
+        stream = model.generate_content(prompt, **kw)
+
+        acc = []
+        print(f"     llm (cluster {idx}): ", end="", flush=True)
+        for ev in stream:
+            token = getattr(ev, "text", None) or _gemini_text_from_resp(ev)
+            if token:
+                acc.append(token)
+                print(token, end="", flush=True)
+        print("")  # newline after the stream finishes
+
+        final = "".join(acc).strip()
+        if not final:
+            final = "Explanation unavailable (empty stream)."
+        finals.append(final)
+        time.sleep(0.03)  # tiny pacing so stdout renders nicely
+
+    return finals
 # --------------------------
 # CLI
 # --------------------------
@@ -678,11 +822,30 @@ def cmd_ask(args):
     }
 
     if args.llm:
-        exps = llm_explain(clusters, args.query, max_items=min(3, len(clusters)))
+        mode = getattr(args, "llm_mode", "auto")
+        try:
+            if mode == "deterministic":
+                exps = [explain_cluster_deterministic(c) for c in clusters[:min(3, len(clusters))]]
+            else:
+                # Try Gemini first
+                if args.stream and args.pretty:
+                    # live streaming under pretty printing
+                    exps = gemini_explain_stream(clusters, args.query, max_items=min(3, len(clusters)))
+                else:
+                    exps = gemini_explain_nonstream(clusters, args.query, max_items=min(3, len(clusters)))
+        except Exception as e:
+            if mode == "gemini":
+                # Strict: user demanded Gemini only → fail loudly
+                raise
+            # auto mode: graceful fallback to deterministic
+            exps = [explain_cluster_deterministic(c) for c in clusters[:min(3, len(clusters))]]
+
+        # attach explanations
         for i, txt in enumerate(exps):
             if i < len(resp["clusters"]):
                 resp["clusters"][i]["explanation"] = txt
-    
+
+
     if args.pretty:
         pretty_print_response(resp, hide_alerts=args.no_alerts,
                               limit_samples=args.limit_samples,
@@ -690,7 +853,7 @@ def cmd_ask(args):
                               add_explain=args.explain)
     else:
         print(json.dumps(resp, indent=2))
-    
+
 
 
 def build_argparser():
@@ -713,12 +876,17 @@ def build_argparser():
     ap_ask.add_argument("--since", type=str, help="ISO start time (e.g., 2025-09-20T08:00:00)")
     ap_ask.add_argument("--k", type=int, default=50, help="Top-K vectors to fetch before clustering")
     ap_ask.add_argument("--max-clusters", type=int, default=5, help="Clusters to return")
-    ap_ask.add_argument("--llm", action="store_true", help="Ask Gemini to explain top clusters")
+    # ap_ask.add_argument("--llm", action="store_true", help="Ask Gemini to explain top clusters")
     ap_ask.add_argument("--pretty", action="store_true", help="Pretty human-readable output")
     ap_ask.add_argument("--no-alerts", action="store_true", help="Hide synthetic ALERT clusters")
     ap_ask.add_argument("--explain", action="store_true", help="Add deterministic analyst-style explanations")
     ap_ask.add_argument("--limit-samples", type=int, default=3, help="Max sample lines per cluster")
     ap_ask.add_argument("--show-raw", action="store_true", help="Show raw log text in samples")
+    # ... inside ap_ask parser definition:
+    ap_ask.add_argument("--llm", action="store_true", help="Generate LLM explanations (Gemini if available)")
+    ap_ask.add_argument("--stream", action="store_true", help="Stream Gemini output live for explanations")
+    ap_ask.add_argument("--llm-mode", choices=["auto","gemini","deterministic"], default="auto",
+                        help="Which explainer to use: 'gemini' (require Gemini), 'deterministic' (rule-based), or 'auto' (Gemini then fallback)")   
 
     ap_ask.set_defaults(func=cmd_ask)
 
